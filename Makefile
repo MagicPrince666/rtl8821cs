@@ -1,10 +1,10 @@
 #
 # Makefile for the Linux Wireless network device drivers.
 #
-ARCH:=arm64
-CROSS_COMPILE:=/home/prince/LubanCatWrt/staging_dir/toolchain-aarch64_generic_gcc-12.3.0_musl/bin/aarch64-openwrt-linux-musl-
-KERNEL_DIR:=/home/prince/LubanCatWrt/build_dir/target-aarch64_generic_musl/linux-rockchip_armv8/linux-6.1.41
-export STAGING_DIR=/home/prince/LubanCatWrt/staging_dir
+#ARCH:=arm64
+#CROSS_COMPILE:=/home/prince/LubanCatWrt/staging_dir/toolchain-aarch64_generic_gcc-12.3.0_musl/bin/aarch64-openwrt-linux-musl-
+#KERNEL_DIR:=/home/prince/LubanCatWrt/build_dir/target-aarch64_generic_musl/linux-rockchip_armv8/linux-6.1.41
+#export STAGING_DIR=/home/prince/LubanCatWrt/staging_dir
 export CONFIG_RTL8821CS = m
 obj-y += rtl8821cs/
 

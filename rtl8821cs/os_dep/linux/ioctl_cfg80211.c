@@ -439,50 +439,6 @@ bool rtw_cfg80211_allow_ch_switch_notify(_adapter *adapter)
 	return 1;
 }
 
-u8 rtw_cfg80211_ch_switch_notify(_adapter *adapter, u8 ch, u8 bw, u8 offset,
-	u8 ht, bool started)
-{
-	struct wiphy *wiphy = adapter_to_wiphy(adapter);
-	u8 ret = _SUCCESS;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
-	struct cfg80211_chan_def chdef;
-
-	ret = rtw_chbw_to_cfg80211_chan_def(wiphy, &chdef, ch, bw, offset, ht);
-	if (ret != _SUCCESS)
-		goto exit;
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0))
-	if (started) {
-		cfg80211_ch_switch_started_notify(adapter->pnetdev, &chdef, 0);
-		goto exit;
-	}
-#endif
-
-	if (!rtw_cfg80211_allow_ch_switch_notify(adapter))
-		goto exit;
-
-	cfg80211_ch_switch_notify(adapter->pnetdev, &chdef);
-
-#else
-	int freq = rtw_ch2freq(ch);
-	enum nl80211_channel_type ctype;
-
-	if (!rtw_cfg80211_allow_ch_switch_notify(adapter))
-		goto exit;
-
-	if (!freq) {
-		ret = _FAIL;
-		goto exit;
-	}
-
-	ctype = rtw_chbw_to_nl80211_channel_type(ch, bw, offset, ht);
-	cfg80211_ch_switch_notify(adapter->pnetdev, freq, ctype);
-#endif
-
-exit:
-	return ret;
-}
 #endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 5, 0)) */
 
 void rtw_2g_channels_init(struct ieee80211_channel *channels)
@@ -1126,7 +1082,11 @@ check_bss:
 		#endif
 
 		#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
 		roam_info.bssid = cur_network->network.MacAddress;
+#else
+		roam_info.links[0].bssid = cur_network->network.MacAddress;
+#endif
 		roam_info.req_ie = pmlmepriv->assoc_req + sizeof(struct rtw_ieee80211_hdr_3addr) + 2;
 		roam_info.req_ie_len = pmlmepriv->assoc_req_len - sizeof(struct rtw_ieee80211_hdr_3addr) - 2;
 		roam_info.resp_ie = pmlmepriv->assoc_rsp + sizeof(struct rtw_ieee80211_hdr_3addr) + 6;
@@ -1253,12 +1213,13 @@ void rtw_cfg80211_indicate_disconnect(_adapter *padapter, u16 reason, u8 locally
 
 
 #ifdef CONFIG_AP_MODE
-static int rtw_cfg80211_ap_set_encryption(struct net_device *dev, struct ieee_param *param)
+static int rtw_cfg80211_ap_set_encryption(struct net_device *dev, struct ieee_param *param, u32 param_len)
 {
 	int ret = 0;
-	u32 wep_key_idx, wep_key_len;
+	u32 wep_key_idx, wep_key_len, wep_total_len;
 	struct sta_info *psta = NULL, *pbcmc_sta = NULL;
 	_adapter *padapter = (_adapter *)rtw_netdev_priv(dev);
+	struct mlme_priv	*pmlmepriv = &padapter->mlmepriv;
 	struct security_priv *psecuritypriv = &(padapter->securitypriv);
 	struct sta_priv *pstapriv = &padapter->stapriv;
 
@@ -1267,11 +1228,20 @@ static int rtw_cfg80211_ap_set_encryption(struct net_device *dev, struct ieee_pa
 	param->u.crypt.err = 0;
 	param->u.crypt.alg[IEEE_CRYPT_ALG_NAME_LEN - 1] = '\0';
 
-	if (is_broadcast_mac_addr(param->sta_addr)) {
+	/* sizeof(struct ieee_param) = 64 bytes; */
+	/* if (param_len !=  (u32) ((u8 *) param->u.crypt.key - (u8 *) param) + param->u.crypt.key_len) */
+	if (param_len !=  sizeof(struct ieee_param) + param->u.crypt.key_len) {
+		ret =  -EINVAL;
+		goto exit;
+	}
+
+	if (param->sta_addr[0] == 0xff && param->sta_addr[1] == 0xff &&
+	    param->sta_addr[2] == 0xff && param->sta_addr[3] == 0xff &&
+	    param->sta_addr[4] == 0xff && param->sta_addr[5] == 0xff) {
 		if (param->u.crypt.idx >= WEP_KEYS
-			#ifdef CONFIG_IEEE80211W
+#ifdef CONFIG_IEEE80211W
 			&& param->u.crypt.idx > BIP_MAX_KEYID
-			#endif
+#endif /* CONFIG_IEEE80211W */
 		) {
 			ret = -EINVAL;
 			goto exit;
@@ -1279,9 +1249,8 @@ static int rtw_cfg80211_ap_set_encryption(struct net_device *dev, struct ieee_pa
 	} else {
 		psta = rtw_get_stainfo(pstapriv, param->sta_addr);
 		if (!psta) {
-			ret = -EINVAL;
-			RTW_INFO(FUNC_ADPT_FMT", sta "MAC_FMT" not found\n"
-				, FUNC_ADPT_ARG(padapter), MAC_ARG(param->sta_addr));
+			/* ret = -EINVAL; */
+			RTW_INFO("rtw_set_encryption(), sta has already been removed or never been added\n");
 			goto exit;
 		}
 	}
@@ -1337,119 +1306,76 @@ static int rtw_cfg80211_ap_set_encryption(struct net_device *dev, struct ieee_pa
 
 	}
 
-	if (!psta) { /* group key */
-		if (param->u.crypt.set_tx == 0) { /* group key, TX only */
+
+	if (!psta && check_fwstate(pmlmepriv, WIFI_AP_STATE)) { /* group key */
+		if (param->u.crypt.set_tx == 0) { /* group key */
 			if (strcmp(param->u.crypt.alg, "WEP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set WEP TX GTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
+				RTW_INFO("%s, set group_key, WEP\n", __FUNCTION__);
+
 				_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+
 				psecuritypriv->dot118021XGrpPrivacy = _WEP40_;
 				if (param->u.crypt.key_len == 13)
 					psecuritypriv->dot118021XGrpPrivacy = _WEP104_;
 
 			} else if (strcmp(param->u.crypt.alg, "TKIP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set TKIP TX GTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
+				RTW_INFO("%s, set group_key, TKIP\n", __FUNCTION__);
+
 				psecuritypriv->dot118021XGrpPrivacy = _TKIP_;
+
 				_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+
+				/* DEBUG_ERR("set key length :param->u.crypt.key_len=%d\n", param->u.crypt.key_len); */
 				/* set mic key */
 				_rtw_memcpy(psecuritypriv->dot118021XGrptxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[16]), 8);
 				_rtw_memcpy(psecuritypriv->dot118021XGrprxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[24]), 8);
+
 				psecuritypriv->busetkipkey = _TRUE;
 
 			} else if (strcmp(param->u.crypt.alg, "CCMP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CCMP TX GTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
+				RTW_INFO("%s, set group_key, CCMP\n", __FUNCTION__);
+
 				psecuritypriv->dot118021XGrpPrivacy = _AES_;
+
 				_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+			}
+#ifdef CONFIG_IEEE80211W
+			else if (strcmp(param->u.crypt.alg, "BIP") == 0) {
+				int no;
 
-			} else if (strcmp(param->u.crypt.alg, "GCMP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GCMP TX GTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-				psecuritypriv->dot118021XGrpPrivacy = _GCMP_;
-				_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,
-					param->u.crypt.key,
-					(param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-
-			} else if (strcmp(param->u.crypt.alg, "GCMP_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GCMP_256 TX GTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-				psecuritypriv->dot118021XGrpPrivacy = _GCMP_256_;
-				_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,
-					param->u.crypt.key,
-					(param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-
-			} else if (strcmp(param->u.crypt.alg, "CCMP_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CCMP_256 TX GTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-				psecuritypriv->dot118021XGrpPrivacy = _CCMP_256_;
-				_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,
-					param->u.crypt.key,
-					(param->u.crypt.key_len > 32 ? 32: param->u.crypt.key_len));
-
-			#ifdef CONFIG_IEEE80211W
-			} else if (strcmp(param->u.crypt.alg, "BIP") == 0) {
-				psecuritypriv->dot11wCipher = _BIP_CMAC_128_;
-				RTW_INFO(FUNC_ADPT_FMT" set TX CMAC-128 IGTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
+				RTW_INFO("BIP key_len=%d , index=%d\n", param->u.crypt.key_len, param->u.crypt.idx);
+				/* save the IGTK key, length 16 bytes */
 				_rtw_memcpy(padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey, param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+				/* RTW_INFO("IGTK key below:\n");
+				for(no=0;no<16;no++)
+					printk(" %02x ", padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey[no]);
+				RTW_INFO("\n"); */
 				padapter->securitypriv.dot11wBIPKeyid = param->u.crypt.idx;
-				psecuritypriv->dot11wBIPtxpn.val = RTW_GET_LE64(param->u.crypt.seq);
 				padapter->securitypriv.binstallBIPkey = _TRUE;
+				RTW_INFO(" ~~~~set sta key:IGKT\n");
 				goto exit;
-			} else if (strcmp(param->u.crypt.alg, "BIP_GMAC_128") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set TX GMAC-128 IGTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-				psecuritypriv->dot11wCipher = _BIP_GMAC_128_;
-				_rtw_memcpy(psecuritypriv->dot11wBIPKey[param->u.crypt.idx].skey,
-					param->u.crypt.key, param->u.crypt.key_len);
-				psecuritypriv->dot11wBIPKeyid = param->u.crypt.idx;
-				psecuritypriv->dot11wBIPtxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-				psecuritypriv->binstallBIPkey = _TRUE;
-				goto exit;
-			} else if (strcmp(param->u.crypt.alg, "BIP_GMAC_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set TX GMAC-256 IGTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-				psecuritypriv->dot11wCipher = _BIP_GMAC_256_;
-				_rtw_memcpy(psecuritypriv->dot11wBIPKey[param->u.crypt.idx].skey,
-					param->u.crypt.key, param->u.crypt.key_len);
-				padapter->securitypriv.dot11wBIPKeyid = param->u.crypt.idx;
-				psecuritypriv->dot11wBIPtxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-				padapter->securitypriv.binstallBIPkey = _TRUE;
-				goto exit;
-			} else if (strcmp(param->u.crypt.alg, "BIP_CMAC_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set TX CMAC-256 IGTK idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-				psecuritypriv->dot11wCipher = _BIP_CMAC_256_;
-				_rtw_memcpy(psecuritypriv->dot11wBIPKey[param->u.crypt.idx].skey,
-					param->u.crypt.key, param->u.crypt.key_len);
-				psecuritypriv->dot11wBIPKeyid = param->u.crypt.idx;
-				psecuritypriv->dot11wBIPtxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-				psecuritypriv->binstallBIPkey = _TRUE;
-				goto exit;
-			#endif /* CONFIG_IEEE80211W */
+			}
+#endif /* CONFIG_IEEE80211W */
+			else {
+				RTW_INFO("%s, set group_key, none\n", __FUNCTION__);
 
-			} else if (strcmp(param->u.crypt.alg, "none") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" clear group key, idx:%u\n"
-					, FUNC_ADPT_ARG(padapter), param->u.crypt.idx);
 				psecuritypriv->dot118021XGrpPrivacy = _NO_PRIVACY_;
-			} else {
-				RTW_WARN(FUNC_ADPT_FMT" set group key, not support\n"
-					, FUNC_ADPT_ARG(padapter));
-				goto exit;
 			}
 
 			psecuritypriv->dot118021XGrpKeyid = param->u.crypt.idx;
-			pbcmc_sta = rtw_get_bcmc_stainfo(padapter);
-			if (pbcmc_sta) {
-				pbcmc_sta->dot11txpn.val = RTW_GET_LE64(param->u.crypt.seq);
-				pbcmc_sta->ieee8021x_blocked = _FALSE;
-				pbcmc_sta->dot118021XPrivacy = psecuritypriv->dot118021XGrpPrivacy; /* rx will use bmc_sta's dot118021XPrivacy			 */
-			}
+
 			psecuritypriv->binstallGrpkey = _TRUE;
+
 			psecuritypriv->dot11PrivacyAlgrthm = psecuritypriv->dot118021XGrpPrivacy;/* !!! */
 
 			rtw_ap_set_group_key(padapter, param->u.crypt.key, psecuritypriv->dot118021XGrpPrivacy, param->u.crypt.idx);
+
+			pbcmc_sta = rtw_get_bcmc_stainfo(padapter);
+			if (pbcmc_sta) {
+				pbcmc_sta->ieee8021x_blocked = _FALSE;
+				pbcmc_sta->dot118021XPrivacy = psecuritypriv->dot118021XGrpPrivacy; /* rx will use bmc_sta's dot118021XPrivacy			 */
+			}
+
 		}
 
 		goto exit;
@@ -1457,199 +1383,102 @@ static int rtw_cfg80211_ap_set_encryption(struct net_device *dev, struct ieee_pa
 	}
 
 	if (psecuritypriv->dot11AuthAlgrthm == dot11AuthAlgrthm_8021X && psta) { /* psk/802_1x */
-		if (param->u.crypt.set_tx == 1) {
-			/* pairwise key */
-			if (param->u.crypt.key_len == 32)
-				_rtw_memcpy(psta->dot118021x_UncstKey.skey,
-						param->u.crypt.key,
-						(param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-			else
-				_rtw_memcpy(psta->dot118021x_UncstKey.skey,
-						param->u.crypt.key,
-						(param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+		if (check_fwstate(pmlmepriv, WIFI_AP_STATE)) {
+			if (param->u.crypt.set_tx == 1) { /* pairwise key */
+				_rtw_memcpy(psta->dot118021x_UncstKey.skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
 
-			if (strcmp(param->u.crypt.alg, "WEP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set WEP PTK of "MAC_FMT" idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot118021XPrivacy = _WEP40_;
-				if (param->u.crypt.key_len == 13)
-					psta->dot118021XPrivacy = _WEP104_;
+				if (strcmp(param->u.crypt.alg, "WEP") == 0) {
+					RTW_INFO("%s, set pairwise key, WEP\n", __FUNCTION__);
 
-			} else if (strcmp(param->u.crypt.alg, "TKIP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set TKIP PTK of "MAC_FMT" idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot118021XPrivacy = _TKIP_;
-				/* set mic key */
-				_rtw_memcpy(psta->dot11tkiptxmickey.skey, &(param->u.crypt.key[16]), 8);
-				_rtw_memcpy(psta->dot11tkiprxmickey.skey, &(param->u.crypt.key[24]), 8);
-				psecuritypriv->busetkipkey = _TRUE;
+					psta->dot118021XPrivacy = _WEP40_;
+					if (param->u.crypt.key_len == 13)
+						psta->dot118021XPrivacy = _WEP104_;
+				} else if (strcmp(param->u.crypt.alg, "TKIP") == 0) {
+					RTW_INFO("%s, set pairwise key, TKIP\n", __FUNCTION__);
 
-			} else if (strcmp(param->u.crypt.alg, "CCMP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CCMP PTK of "MAC_FMT" idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot118021XPrivacy = _AES_;
+					psta->dot118021XPrivacy = _TKIP_;
 
-			} else if (strcmp(param->u.crypt.alg, "GCMP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GCMP PTK of "MAC_FMT" idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot118021XPrivacy = _GCMP_;
+					/* DEBUG_ERR("set key length :param->u.crypt.key_len=%d\n", param->u.crypt.key_len); */
+					/* set mic key */
+					_rtw_memcpy(psta->dot11tkiptxmickey.skey, &(param->u.crypt.key[16]), 8);
+					_rtw_memcpy(psta->dot11tkiprxmickey.skey, &(param->u.crypt.key[24]), 8);
 
-			} else if (strcmp(param->u.crypt.alg, "GCMP_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GCMP_256 PTK of "MAC_FMT" idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot118021XPrivacy = _GCMP_256_;
+					psecuritypriv->busetkipkey = _TRUE;
 
-			} else if (strcmp(param->u.crypt.alg, "CCMP_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CCMP_256 PTK of "MAC_FMT" idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot118021XPrivacy = _CCMP_256_;
+				} else if (strcmp(param->u.crypt.alg, "CCMP") == 0) {
 
-			} else if (strcmp(param->u.crypt.alg, "none") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" clear pairwise key of "MAC_FMT" idx:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx);
-				psta->dot118021XPrivacy = _NO_PRIVACY_;
-			} else {
-				RTW_WARN(FUNC_ADPT_FMT" set pairwise key of "MAC_FMT", not support\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr));
-				goto exit;
-			}
+					RTW_INFO("%s, set pairwise key, CCMP\n", __FUNCTION__);
 
-			psta->dot11txpn.val = RTW_GET_LE64(param->u.crypt.seq);
-			psta->dot11rxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-			psta->ieee8021x_blocked = _FALSE;
+					psta->dot118021XPrivacy = _AES_;
+				} else {
+					RTW_INFO("%s, set pairwise key, none\n", __FUNCTION__);
 
-			if (psta->dot118021XPrivacy != _NO_PRIVACY_) {
+					psta->dot118021XPrivacy = _NO_PRIVACY_;
+				}
+
+				rtw_ap_set_pairwise_key(padapter, psta);
+
+				psta->ieee8021x_blocked = _FALSE;
+
 				psta->bpairwise_key_installed = _TRUE;
 
-				/* WPA2 key-handshake has completed */
-				if (psecuritypriv->ndisauthtype == Ndis802_11AuthModeWPA2PSK)
-					psta->state &= (~WIFI_UNDER_KEY_HANDSHAKE);
+			} else { /* group key??? */
+				if (strcmp(param->u.crypt.alg, "WEP") == 0) {
+					_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+
+					psecuritypriv->dot118021XGrpPrivacy = _WEP40_;
+					if (param->u.crypt.key_len == 13)
+						psecuritypriv->dot118021XGrpPrivacy = _WEP104_;
+				} else if (strcmp(param->u.crypt.alg, "TKIP") == 0) {
+					psecuritypriv->dot118021XGrpPrivacy = _TKIP_;
+
+					_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+
+					/* DEBUG_ERR("set key length :param->u.crypt.key_len=%d\n", param->u.crypt.key_len); */
+					/* set mic key */
+					_rtw_memcpy(psecuritypriv->dot118021XGrptxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[16]), 8);
+					_rtw_memcpy(psecuritypriv->dot118021XGrprxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[24]), 8);
+
+					psecuritypriv->busetkipkey = _TRUE;
+
+				} else if (strcmp(param->u.crypt.alg, "CCMP") == 0) {
+					psecuritypriv->dot118021XGrpPrivacy = _AES_;
+
+					_rtw_memcpy(psecuritypriv->dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+				} else
+					psecuritypriv->dot118021XGrpPrivacy = _NO_PRIVACY_;
+
+				psecuritypriv->dot118021XGrpKeyid = param->u.crypt.idx;
+
+				psecuritypriv->binstallGrpkey = _TRUE;
+
+				psecuritypriv->dot11PrivacyAlgrthm = psecuritypriv->dot118021XGrpPrivacy;/* !!! */
+
+				rtw_ap_set_group_key(padapter, param->u.crypt.key, psecuritypriv->dot118021XGrpPrivacy, param->u.crypt.idx);
+
+				pbcmc_sta = rtw_get_bcmc_stainfo(padapter);
+				if (pbcmc_sta) {
+					pbcmc_sta->ieee8021x_blocked = _FALSE;
+					pbcmc_sta->dot118021XPrivacy = psecuritypriv->dot118021XGrpPrivacy; /* rx will use bmc_sta's dot118021XPrivacy			 */
+				}
+
 			}
 
-			rtw_ap_set_pairwise_key(padapter, psta);
-		} else {
-			/* peer's group key, RX only */
-			#ifdef CONFIG_RTW_MESH
-			if (strcmp(param->u.crypt.alg, "CCMP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CCMP GTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->group_privacy = _AES_;
-				_rtw_memcpy(psta->gtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-				psta->gtk_bmp |= BIT(param->u.crypt.idx);
-				psta->gtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-
-			} else if (strcmp(param->u.crypt.alg, "GCMP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GCMP GTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->group_privacy = _GCMP_;
-				_rtw_memcpy(psta->gtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-				psta->gtk_bmp |= BIT(param->u.crypt.idx);
-				psta->gtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-
-			} else if (strcmp(param->u.crypt.alg, "CCMP_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CCMP_256 GTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->group_privacy = _CCMP_256_;
-				_rtw_memcpy(psta->gtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-				psta->gtk_bmp |= BIT(param->u.crypt.idx);
-				psta->gtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-
-			} else if (strcmp(param->u.crypt.alg, "GCMP_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GCMP_256 GTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->group_privacy = _GCMP_256_;
-				_rtw_memcpy(psta->gtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-				psta->gtk_bmp |= BIT(param->u.crypt.idx);
-				psta->gtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-
-			#ifdef CONFIG_IEEE80211W
-			} else if (strcmp(param->u.crypt.alg, "BIP") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CMAC-128 IGTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot11wCipher = _BIP_CMAC_128_;
-				_rtw_memcpy(psta->igtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-				psta->igtk_bmp |= BIT(param->u.crypt.idx);
-				psta->igtk_id = param->u.crypt.idx;
-				psta->igtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-				goto exit;
-
-			} else if (strcmp(param->u.crypt.alg, "BIP_GMAC_128") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GMAC-128 IGTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot11wCipher = _BIP_GMAC_128_;
-				_rtw_memcpy(psta->igtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-				psta->igtk_bmp |= BIT(param->u.crypt.idx);
-				psta->igtk_id = param->u.crypt.idx;
-				psta->igtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-				goto exit;
-
-			} else if (strcmp(param->u.crypt.alg, "BIP_CMAC_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set CMAC-256 IGTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot11wCipher = _BIP_CMAC_256_;
-				_rtw_memcpy(psta->igtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-				psta->igtk_bmp |= BIT(param->u.crypt.idx);
-				psta->igtk_id = param->u.crypt.idx;
-				psta->igtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-				goto exit;
-
-			} else if (strcmp(param->u.crypt.alg, "BIP_GMAC_256") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" set GMAC-256 IGTK of "MAC_FMT", idx:%u, len:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx, param->u.crypt.key_len);
-				psta->dot11wCipher = _BIP_GMAC_256_;
-				_rtw_memcpy(psta->igtk.skey, param->u.crypt.key, (param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-				psta->igtk_bmp |= BIT(param->u.crypt.idx);
-				psta->igtk_id = param->u.crypt.idx;
-				psta->igtk_pn.val = RTW_GET_LE64(param->u.crypt.seq);
-				goto exit;
-			#endif /* CONFIG_IEEE80211W */
-
-			} else if (strcmp(param->u.crypt.alg, "none") == 0) {
-				RTW_INFO(FUNC_ADPT_FMT" clear group key of "MAC_FMT", idx:%u\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr)
-					, param->u.crypt.idx);
-				psta->group_privacy = _NO_PRIVACY_;
-				psta->gtk_bmp &= ~BIT(param->u.crypt.idx);
-			} else
-			#endif /* CONFIG_RTW_MESH */
-			{
-				RTW_WARN(FUNC_ADPT_FMT" set group key of "MAC_FMT", not support\n"
-					, FUNC_ADPT_ARG(padapter), MAC_ARG(psta->cmn.mac_addr));
-				goto exit;
-			}
-
-			#ifdef CONFIG_RTW_MESH
-			rtw_ap_set_sta_key(padapter, psta->cmn.mac_addr, psta->group_privacy
-				, param->u.crypt.key, param->u.crypt.idx, 1);
-			#endif
 		}
 
 	}
 
 exit:
+
 	return ret;
+
 }
 #endif /* CONFIG_AP_MODE */
 
-static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param *param)
+static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param *param, u32 param_len)
 {
 	int ret = 0;
-	u32 wep_key_idx, wep_key_len;
+	u32 wep_key_idx, wep_key_len, wep_total_len;
 	_adapter *padapter = (_adapter *)rtw_netdev_priv(dev);
 	struct mlme_priv	*pmlmepriv = &padapter->mlmepriv;
 	struct security_priv *psecuritypriv = &padapter->securitypriv;
@@ -1657,16 +1486,24 @@ static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param
 	struct wifidirect_info *pwdinfo = &padapter->wdinfo;
 #endif /* CONFIG_P2P */
 
+
 	RTW_INFO("%s\n", __func__);
 
 	param->u.crypt.err = 0;
 	param->u.crypt.alg[IEEE_CRYPT_ALG_NAME_LEN - 1] = '\0';
 
-	if (is_broadcast_mac_addr(param->sta_addr)) {
+	if (param_len < (u32)((u8 *) param->u.crypt.key - (u8 *) param) + param->u.crypt.key_len) {
+		ret =  -EINVAL;
+		goto exit;
+	}
+
+	if (param->sta_addr[0] == 0xff && param->sta_addr[1] == 0xff &&
+	    param->sta_addr[2] == 0xff && param->sta_addr[3] == 0xff &&
+	    param->sta_addr[4] == 0xff && param->sta_addr[5] == 0xff) {
 		if (param->u.crypt.idx >= WEP_KEYS
-			#ifdef CONFIG_IEEE80211W
+#ifdef CONFIG_IEEE80211W
 			&& param->u.crypt.idx > BIP_MAX_KEYID
-			#endif
+#endif /* CONFIG_IEEE80211W */
 		) {
 			ret = -EINVAL;
 			goto exit;
@@ -1687,7 +1524,7 @@ static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param
 		wep_key_idx = param->u.crypt.idx;
 		wep_key_len = param->u.crypt.key_len;
 
-		if ((wep_key_idx >= WEP_KEYS) || (wep_key_len <= 0)) {
+		if ((wep_key_idx > WEP_KEYS) || (wep_key_len <= 0)) {
 			ret = -EINVAL;
 			goto exit;
 		}
@@ -1726,7 +1563,7 @@ static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param
 
 		if (check_fwstate(pmlmepriv, WIFI_STATION_STATE | WIFI_MP_STATE) == _TRUE) { /* sta mode */
 #ifdef CONFIG_RTW_80211R
-			if (rtw_ft_roam(padapter))
+			if ((rtw_to_roam(padapter) > 0) && rtw_chk_ft_flags(padapter, RTW_FT_SUPPORTED))
 				psta = rtw_get_stainfo(pstapriv, pmlmepriv->assoc_bssid);
 			else
 #endif
@@ -1739,109 +1576,62 @@ static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param
 				if (strcmp(param->u.crypt.alg, "none") != 0)
 					psta->ieee8021x_blocked = _FALSE;
 
+
 				if ((padapter->securitypriv.ndisencryptstatus == Ndis802_11Encryption2Enabled) ||
 				    (padapter->securitypriv.ndisencryptstatus ==  Ndis802_11Encryption3Enabled))
 					psta->dot118021XPrivacy = padapter->securitypriv.dot11PrivacyAlgrthm;
 
 				if (param->u.crypt.set_tx == 1) { /* pairwise key */
-					RTW_INFO(FUNC_ADPT_FMT" set %s PTK idx:%u, len:%u\n"
-						, FUNC_ADPT_ARG(padapter), param->u.crypt.alg, param->u.crypt.idx, param->u.crypt.key_len);
 
-					if (strcmp(param->u.crypt.alg, "GCMP_256") == 0
-						|| strcmp(param->u.crypt.alg, "CCMP_256") == 0) {
-						_rtw_memcpy(psta->dot118021x_UncstKey.skey,
-							param->u.crypt.key,
-							((param->u.crypt.key_len > 32) ?
-								32 : param->u.crypt.key_len));
-					} else
-						_rtw_memcpy(psta->dot118021x_UncstKey.skey,
-							param->u.crypt.key,
-							(param->u.crypt.key_len > 16 ?
-								16 : param->u.crypt.key_len));
+					RTW_INFO("%s, : param->u.crypt.set_tx ==1\n", __func__);
+
+					_rtw_memcpy(psta->dot118021x_UncstKey.skey,  param->u.crypt.key, (param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
 
 					if (strcmp(param->u.crypt.alg, "TKIP") == 0) { /* set mic key */
+						/* DEBUG_ERR(("\nset key length :param->u.crypt.key_len=%d\n", param->u.crypt.key_len)); */
 						_rtw_memcpy(psta->dot11tkiptxmickey.skey, &(param->u.crypt.key[16]), 8);
 						_rtw_memcpy(psta->dot11tkiprxmickey.skey, &(param->u.crypt.key[24]), 8);
-						padapter->securitypriv.busetkipkey = _FALSE;
-					}
-					psta->dot11txpn.val = RTW_GET_LE64(param->u.crypt.seq);
-					psta->dot11rxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-					psta->bpairwise_key_installed = _TRUE;
-					#ifdef CONFIG_RTW_80211R
-					psta->ft_pairwise_key_installed = _TRUE;
-					#endif
-					rtw_setstakey_cmd(padapter, psta, UNICAST_KEY, _TRUE);
 
+						padapter->securitypriv.busetkipkey = _FALSE;
+						/* _set_timer(&padapter->securitypriv.tkip_timer, 50);						 */
+					}
+					psta->bpairwise_key_installed = _TRUE;
+#ifdef CONFIG_RTW_80211R
+					psta->ft_pairwise_key_installed = _TRUE;
+#endif
+					/* DEBUG_ERR((" param->u.crypt.key_len=%d\n",param->u.crypt.key_len)); */
+					RTW_INFO(" ~~~~set sta key:unicastkey\n");
+
+					rtw_setstakey_cmd(padapter, psta, UNICAST_KEY, _TRUE);
 				} else { /* group key */
-					if (strcmp(param->u.crypt.alg, "TKIP") == 0
-						|| strcmp(param->u.crypt.alg, "CCMP") == 0
-						|| strcmp(param->u.crypt.alg, "GCMP") == 0) {
-						RTW_INFO(FUNC_ADPT_FMT" set %s GTK idx:%u, len:%u\n"
-							, FUNC_ADPT_ARG(padapter), param->u.crypt.alg, param->u.crypt.idx, param->u.crypt.key_len);
-						_rtw_memcpy(padapter->securitypriv.dot118021XGrpKey[param->u.crypt.idx].skey,
-							param->u.crypt.key,
+					if (strcmp(param->u.crypt.alg, "TKIP") == 0 || strcmp(param->u.crypt.alg, "CCMP") == 0) {
+						_rtw_memcpy(padapter->securitypriv.dot118021XGrpKey[param->u.crypt.idx].skey,  param->u.crypt.key,
 							(param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
 						_rtw_memcpy(padapter->securitypriv.dot118021XGrptxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[16]), 8);
 						_rtw_memcpy(padapter->securitypriv.dot118021XGrprxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[24]), 8);
 						padapter->securitypriv.binstallGrpkey = _TRUE;
-						if (param->u.crypt.idx < 4)
-							_rtw_memcpy(padapter->securitypriv.iv_seq[param->u.crypt.idx], param->u.crypt.seq, 8);
-						padapter->securitypriv.dot118021XGrpKeyid = param->u.crypt.idx;
-						rtw_set_key(padapter, &padapter->securitypriv, param->u.crypt.idx, 1, _TRUE);
-					} else if (strcmp(param->u.crypt.alg, "GCMP_256") == 0
-						|| strcmp(param->u.crypt.alg, "CCMP_256") == 0) {
-						RTW_INFO(FUNC_ADPT_FMT" set %s GTK idx:%u, len:%u\n"
-							, FUNC_ADPT_ARG(padapter), param->u.crypt.alg, param->u.crypt.idx, param->u.crypt.key_len);
-						_rtw_memcpy(
-							padapter->securitypriv.dot118021XGrpKey[param->u.crypt.idx].skey,
-							param->u.crypt.key,
-							(param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-						padapter->securitypriv.binstallGrpkey = _TRUE;
-						padapter->securitypriv.dot118021XGrpKeyid = param->u.crypt.idx;
-						rtw_set_key(padapter, &padapter->securitypriv, param->u.crypt.idx, 1, _TRUE);
-					#ifdef CONFIG_IEEE80211W
-					} else if (strcmp(param->u.crypt.alg, "BIP") == 0) {
-						psecuritypriv->dot11wCipher = _BIP_CMAC_128_;
-						RTW_INFO(FUNC_ADPT_FMT" set CMAC-128 IGTK idx:%u, len:%u\n"
-							, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-						_rtw_memcpy(padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey,
-							param->u.crypt.key,
-							(param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-						psecuritypriv->dot11wBIPKeyid = param->u.crypt.idx;
-						psecuritypriv->dot11wBIPrxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-						psecuritypriv->binstallBIPkey = _TRUE;
-					} else if (strcmp(param->u.crypt.alg, "BIP_GMAC_128") == 0) {
-						psecuritypriv->dot11wCipher = _BIP_GMAC_128_;
-						RTW_INFO(FUNC_ADPT_FMT" set GMAC-128 IGTK idx:%u, len:%u\n"
-							, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-						_rtw_memcpy(padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey,
-							param->u.crypt.key,
-							(param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
-						psecuritypriv->dot11wBIPKeyid = param->u.crypt.idx;
-						psecuritypriv->dot11wBIPrxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-						psecuritypriv->binstallBIPkey = _TRUE;
-					} else if (strcmp(param->u.crypt.alg, "BIP_GMAC_256") == 0) {
-						psecuritypriv->dot11wCipher = _BIP_GMAC_256_;
-						RTW_INFO(FUNC_ADPT_FMT" set GMAC-256 IGTK idx:%u, len:%u\n"
-							, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-						_rtw_memcpy(padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey,
-							param->u.crypt.key,
-							(param->u.crypt.key_len > 32 ? 32 : param->u.crypt.key_len));
-						psecuritypriv->dot11wBIPKeyid = param->u.crypt.idx;
-						psecuritypriv->dot11wBIPrxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-						psecuritypriv->binstallBIPkey = _TRUE;
-					} else if (strcmp(param->u.crypt.alg, "BIP_CMAC_256") == 0) {
-						psecuritypriv->dot11wCipher = _BIP_CMAC_256_;
-						RTW_INFO(FUNC_ADPT_FMT" set CMAC-256 IGTK idx:%u, len:%u\n"
-							, FUNC_ADPT_ARG(padapter), param->u.crypt.idx, param->u.crypt.key_len);
-						_rtw_memcpy(psecuritypriv->dot11wBIPKey[param->u.crypt.idx].skey,
-							param->u.crypt.key, param->u.crypt.key_len);
-						psecuritypriv->dot11wBIPKeyid = param->u.crypt.idx;
-						psecuritypriv->dot11wBIPrxpn.val = RTW_GET_LE64(param->u.crypt.seq);
-						psecuritypriv->binstallBIPkey = _TRUE;
-					#endif /* CONFIG_IEEE80211W */
+						/* DEBUG_ERR((" param->u.crypt.key_len=%d\n", param->u.crypt.key_len)); */
+						RTW_INFO(" ~~~~set sta key:groupkey\n");
 
+						padapter->securitypriv.dot118021XGrpKeyid = param->u.crypt.idx;
+						rtw_set_key(padapter, &padapter->securitypriv, param->u.crypt.idx, 1, _TRUE);
 					}
+#ifdef CONFIG_IEEE80211W
+					else if (strcmp(param->u.crypt.alg, "BIP") == 0) {
+						int no;
+						/* RTW_INFO("BIP key_len=%d , index=%d @@@@@@@@@@@@@@@@@@\n", param->u.crypt.key_len, param->u.crypt.idx); */
+						/* save the IGTK key, length 16 bytes */
+						_rtw_memcpy(padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey,  param->u.crypt.key,
+							(param->u.crypt.key_len > 16 ? 16 : param->u.crypt.key_len));
+						/*RTW_INFO("IGTK key below:\n");
+						for(no=0;no<16;no++)
+							printk(" %02x ", padapter->securitypriv.dot11wBIPKey[param->u.crypt.idx].skey[no]);
+						RTW_INFO("\n");*/
+						padapter->securitypriv.dot11wBIPKeyid = param->u.crypt.idx;
+						padapter->securitypriv.binstallBIPkey = _TRUE;
+						RTW_INFO(" ~~~~set sta key:IGKT\n");
+					}
+#endif /* CONFIG_IEEE80211W */
 
 #ifdef CONFIG_P2P
 					if (pwdinfo->driver_interface == DRIVER_CFG80211) {
@@ -1849,9 +1639,6 @@ static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param
 							rtw_p2p_set_state(pwdinfo, P2P_STATE_PROVISIONING_DONE);
 					}
 #endif /* CONFIG_P2P */
-
-					/* WPA/WPA2 key-handshake has completed */
-					clr_fwstate(pmlmepriv, WIFI_UNDER_KEY_HANDSHAKE);
 
 				}
 			}
@@ -1872,10 +1659,64 @@ static int rtw_cfg80211_set_encryption(struct net_device *dev, struct ieee_param
 		}
 	}
 
-	#ifdef CONFIG_WAPI_SUPPORT
-	if (strcmp(param->u.crypt.alg, "SMS4") == 0)
-		rtw_wapi_set_set_encryption(padapter, param);
-	#endif
+#ifdef CONFIG_WAPI_SUPPORT
+	if (strcmp(param->u.crypt.alg, "SMS4") == 0) {
+		PRT_WAPI_T			pWapiInfo = &padapter->wapiInfo;
+		PRT_WAPI_STA_INFO	pWapiSta;
+		u8					WapiASUEPNInitialValueSrc[16] = {0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C} ;
+		u8					WapiAEPNInitialValueSrc[16] = {0x37, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C} ;
+		u8					WapiAEMultiCastPNInitialValueSrc[16] = {0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C, 0x36, 0x5C} ;
+
+		if (param->u.crypt.set_tx == 1) {
+			list_for_each_entry(pWapiSta, &pWapiInfo->wapiSTAUsedList, list) {
+				if (_rtw_memcmp(pWapiSta->PeerMacAddr, param->sta_addr, 6)) {
+					_rtw_memcpy(pWapiSta->lastTxUnicastPN, WapiASUEPNInitialValueSrc, 16);
+
+					pWapiSta->wapiUsk.bSet = true;
+					_rtw_memcpy(pWapiSta->wapiUsk.dataKey, param->u.crypt.key, 16);
+					_rtw_memcpy(pWapiSta->wapiUsk.micKey, param->u.crypt.key + 16, 16);
+					pWapiSta->wapiUsk.keyId = param->u.crypt.idx ;
+					pWapiSta->wapiUsk.bTxEnable = true;
+
+					_rtw_memcpy(pWapiSta->lastRxUnicastPNBEQueue, WapiAEPNInitialValueSrc, 16);
+					_rtw_memcpy(pWapiSta->lastRxUnicastPNBKQueue, WapiAEPNInitialValueSrc, 16);
+					_rtw_memcpy(pWapiSta->lastRxUnicastPNVIQueue, WapiAEPNInitialValueSrc, 16);
+					_rtw_memcpy(pWapiSta->lastRxUnicastPNVOQueue, WapiAEPNInitialValueSrc, 16);
+					_rtw_memcpy(pWapiSta->lastRxUnicastPN, WapiAEPNInitialValueSrc, 16);
+					pWapiSta->wapiUskUpdate.bTxEnable = false;
+					pWapiSta->wapiUskUpdate.bSet = false;
+
+					if (psecuritypriv->sw_encrypt == false || psecuritypriv->sw_decrypt == false) {
+						/* set unicast key for ASUE */
+						rtw_wapi_set_key(padapter, &pWapiSta->wapiUsk, pWapiSta, false, false);
+					}
+				}
+			}
+		} else {
+			list_for_each_entry(pWapiSta, &pWapiInfo->wapiSTAUsedList, list) {
+				if (_rtw_memcmp(pWapiSta->PeerMacAddr, get_bssid(pmlmepriv), 6)) {
+					pWapiSta->wapiMsk.bSet = true;
+					_rtw_memcpy(pWapiSta->wapiMsk.dataKey, param->u.crypt.key, 16);
+					_rtw_memcpy(pWapiSta->wapiMsk.micKey, param->u.crypt.key + 16, 16);
+					pWapiSta->wapiMsk.keyId = param->u.crypt.idx ;
+					pWapiSta->wapiMsk.bTxEnable = false;
+					if (!pWapiSta->bSetkeyOk)
+						pWapiSta->bSetkeyOk = true;
+					pWapiSta->bAuthenticateInProgress = false;
+
+					_rtw_memcpy(pWapiSta->lastRxMulticastPN, WapiAEMultiCastPNInitialValueSrc, 16);
+
+					if (psecuritypriv->sw_decrypt == false) {
+						/* set rx broadcast key for ASUE */
+						rtw_wapi_set_key(padapter, &pWapiSta->wapiMsk, pWapiSta, true, false);
+					}
+				}
+
+			}
+		}
+	}
+#endif
+
 
 exit:
 
@@ -1886,6 +1727,9 @@ exit:
 }
 
 static int cfg80211_rtw_add_key(struct wiphy *wiphy, struct net_device *ndev
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	, int link_id
+#endif
 	, u8 key_index
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
 	, bool pairwise
@@ -1903,21 +1747,17 @@ static int cfg80211_rtw_add_key(struct wiphy *wiphy, struct net_device *ndev
 	struct sta_info *ptdls_sta;
 #endif /* CONFIG_TDLS */
 
-	if (mac_addr)
-		RTW_INFO(FUNC_NDEV_FMT" adding key for %pM\n", FUNC_NDEV_ARG(ndev), mac_addr);
-	RTW_INFO(FUNC_NDEV_FMT" cipher=0x%x\n", FUNC_NDEV_ARG(ndev), params->cipher);
-	RTW_INFO(FUNC_NDEV_FMT" key_len=%d, key_index=%d\n", FUNC_NDEV_ARG(ndev), params->key_len, key_index);
+	RTW_INFO(FUNC_NDEV_FMT" adding key for %pM\n", FUNC_NDEV_ARG(ndev), mac_addr);
+	RTW_INFO("cipher=0x%x\n", params->cipher);
+	RTW_INFO("key_len=0x%x\n", params->key_len);
+	RTW_INFO("seq_len=0x%x\n", params->seq_len);
+	RTW_INFO("key_index=%d\n", key_index);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
-	RTW_INFO(FUNC_NDEV_FMT" pairwise=%d\n", FUNC_NDEV_ARG(ndev), pairwise);
-#endif
-
-	if (rtw_cfg80211_sync_iftype(padapter) != _SUCCESS) {
-		ret = -ENOTSUPP;
-		goto addkey_end;
-	}
+	RTW_INFO("pairwise=%d\n", pairwise);
+#endif /* (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) */
 
 	param_len = sizeof(struct ieee_param) + params->key_len;
-	param = rtw_malloc(param_len);
+	param = (struct ieee_param *)rtw_malloc(param_len);
 	if (param == NULL)
 		return -1;
 
@@ -1942,27 +1782,9 @@ static int cfg80211_rtw_add_key(struct wiphy *wiphy, struct net_device *ndev
 	case WLAN_CIPHER_SUITE_CCMP:
 		alg_name = "CCMP";
 		break;
-	case WIFI_CIPHER_SUITE_GCMP:
-		alg_name = "GCMP";
-		break;
-	case WIFI_CIPHER_SUITE_GCMP_256:
-		alg_name = "GCMP_256";
-		break;
-	case WIFI_CIPHER_SUITE_CCMP_256:
-		alg_name = "CCMP_256";
-		break;
 #ifdef CONFIG_IEEE80211W
 	case WLAN_CIPHER_SUITE_AES_CMAC:
 		alg_name = "BIP";
-		break;
-	case WIFI_CIPHER_SUITE_BIP_GMAC_128:
-		alg_name = "BIP_GMAC_128";
-		break;
-	case WIFI_CIPHER_SUITE_BIP_GMAC_256:
-		alg_name = "BIP_GMAC_256";
-		break;
-	case WIFI_CIPHER_SUITE_BIP_CMAC_256:
-		alg_name = "BIP_CMAC_256";
 		break;
 #endif /* CONFIG_IEEE80211W */
 #ifdef CONFIG_WAPI_SUPPORT
@@ -1988,23 +1810,18 @@ static int cfg80211_rtw_add_key(struct wiphy *wiphy, struct net_device *ndev
 	strncpy((char *)param->u.crypt.alg, alg_name, IEEE_CRYPT_ALG_NAME_LEN);
 
 
-	if (!mac_addr || is_broadcast_ether_addr(mac_addr)
-		#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
-		|| !pairwise
-		#endif
-	) {
+	if (!mac_addr || is_broadcast_ether_addr(mac_addr)) {
 		param->u.crypt.set_tx = 0; /* for wpa/wpa2 group key */
 	} else {
 		param->u.crypt.set_tx = 1; /* for wpa/wpa2 pairwise key */
 	}
 
+
+	/* param->u.crypt.idx = key_index - 1; */
 	param->u.crypt.idx = key_index;
 
-	if (params->seq_len && params->seq) {
+	if (params->seq_len && params->seq)
 		_rtw_memcpy(param->u.crypt.seq, (u8 *)params->seq, params->seq_len);
-		RTW_INFO(FUNC_NDEV_FMT" seq_len:%u, seq:0x%llx\n", FUNC_NDEV_ARG(ndev)
-			, params->seq_len, RTW_GET_LE64(param->u.crypt.seq));
-	}
 
 	if (params->key_len && params->key) {
 		param->u.crypt.key_len = params->key_len;
@@ -2022,32 +1839,36 @@ static int cfg80211_rtw_add_key(struct wiphy *wiphy, struct net_device *ndev
 			}
 		}
 #endif /* CONFIG_TDLS */
-		ret = rtw_cfg80211_set_encryption(ndev, param);
-	} else if (MLME_IS_AP(padapter) || MLME_IS_MESH(padapter)) {
+
+		ret =  rtw_cfg80211_set_encryption(ndev, param, param_len);
+	} else if (check_fwstate(pmlmepriv, WIFI_AP_STATE) == _TRUE) {
 #ifdef CONFIG_AP_MODE
 		if (mac_addr)
 			_rtw_memcpy(param->sta_addr, (void *)mac_addr, ETH_ALEN);
 
-		ret = rtw_cfg80211_ap_set_encryption(ndev, param);
+		ret = rtw_cfg80211_ap_set_encryption(ndev, param, param_len);
 #endif
 	} else if (check_fwstate(pmlmepriv, WIFI_ADHOC_STATE) == _TRUE
 		|| check_fwstate(pmlmepriv, WIFI_ADHOC_MASTER_STATE) == _TRUE
 	) {
 		/* RTW_INFO("@@@@@@@@@@ fw_state=0x%x, iftype=%d\n", pmlmepriv->fw_state, rtw_wdev->iftype); */
-		ret = rtw_cfg80211_set_encryption(ndev, param);
+		ret =  rtw_cfg80211_set_encryption(ndev, param, param_len);
 	} else
 		RTW_INFO("error! fw_state=0x%x, iftype=%d\n", pmlmepriv->fw_state, rtw_wdev->iftype);
 
 
 addkey_end:
 	if (param)
-		rtw_mfree(param, param_len);
+		rtw_mfree((u8 *)param, param_len);
 
 	return ret;
 
 }
 
 static int cfg80211_rtw_get_key(struct wiphy *wiphy, struct net_device *ndev
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	, int link_id
+#endif
 	, u8 keyid
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
 	, bool pairwise
@@ -2055,188 +1876,34 @@ static int cfg80211_rtw_get_key(struct wiphy *wiphy, struct net_device *ndev
 	, const u8 *mac_addr, void *cookie
 	, void (*callback)(void *cookie, struct key_params *))
 {
-#define GET_KEY_PARAM_FMT_S " keyid=%d"
-#define GET_KEY_PARAM_ARG_S , keyid
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
-	#define GET_KEY_PARAM_FMT_2_6_37 ", pairwise=%d"
-	#define GET_KEY_PARAM_ARG_2_6_37 , pairwise
-#else
-	#define GET_KEY_PARAM_FMT_2_6_37 ""
-	#define GET_KEY_PARAM_ARG_2_6_37
-#endif
-#define GET_KEY_PARAM_FMT_E ", addr=%pM"
-#define GET_KEY_PARAM_ARG_E , mac_addr
-
-	_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
-	struct security_priv *sec = &adapter->securitypriv;
-	struct sta_priv *stapriv = &adapter->stapriv;
-	struct sta_info *sta = NULL;
-	u32 cipher = _NO_PRIVACY_;
-	union Keytype *key = NULL;
-	u8 key_len = 0;
-	u64 *pn = NULL;
-	u8 pn_len = 0;
-	u8 pn_val[8] = {0};
-
+#if 0
+	struct iwm_priv *iwm = ndev_to_iwm(ndev);
+	struct iwm_key *key = &iwm->keys[key_index];
 	struct key_params params;
-	int ret = -ENOENT;
 
-	if (keyid >= WEP_KEYS
-		#ifdef CONFIG_IEEE80211W
-		&& keyid > BIP_MAX_KEYID
-		#endif
-	)
-		goto exit;
+	IWM_DBG_WEXT(iwm, DBG, "Getting key %d\n", key_index);
 
-	if (!mac_addr || is_broadcast_ether_addr(mac_addr)
-		#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
-		|| (MLME_IS_STA(adapter) && !pairwise)
-		#endif
-	) {
-		/* WEP key, TX GTK/IGTK, RX GTK/IGTK(for STA mode) */
-		if (is_wep_enc(sec->dot118021XGrpPrivacy)) {
-			if (keyid >= WEP_KEYS)
-				goto exit;
-			if (!(sec->key_mask & BIT(keyid)))
-				goto exit;
-			cipher = sec->dot118021XGrpPrivacy;
-			key = &sec->dot11DefKey[keyid];
-		} else {
-			if (keyid < WEP_KEYS) {
-				if (sec->binstallGrpkey != _TRUE)
-					goto exit;
-				cipher = sec->dot118021XGrpPrivacy;
-				key = &sec->dot118021XGrpKey[keyid];
-				sta = rtw_get_bcmc_stainfo(adapter);
-				if (sta)
-					pn = &sta->dot11txpn.val;
-			#ifdef CONFIG_IEEE80211W
-			} else if (keyid <= BIP_MAX_KEYID) {
-				if (SEC_IS_BIP_KEY_INSTALLED(sec) != _TRUE)
-					goto exit;
-				cipher = sec->dot11wCipher;
-				key = &sec->dot11wBIPKey[keyid];
-				pn = &sec->dot11wBIPtxpn.val;
-			#endif
-			}
-		}
-	} else {
-		/* Pairwise key, RX GTK/IGTK for specific peer */
-		sta = rtw_get_stainfo(stapriv, mac_addr);
-		if (!sta)
-			goto exit;
+	memset(&params, 0, sizeof(params));
 
-		if (keyid < WEP_KEYS && pairwise) {
-			if (sta->bpairwise_key_installed != _TRUE)
-				goto exit;
-			cipher = sta->dot118021XPrivacy;
-			key = &sta->dot118021x_UncstKey;
-		#ifdef CONFIG_RTW_MESH
-		} else if (keyid < WEP_KEYS && !pairwise) {
-			if (!(sta->gtk_bmp & BIT(keyid)))
-				goto exit;
-			cipher = sta->group_privacy;
-			key = &sta->gtk;
-		#ifdef CONFIG_IEEE80211W
-		} else if (keyid <= BIP_MAX_KEYID && !pairwise) {
-			if (!(sta->igtk_bmp & BIT(keyid)))
-				goto exit;
-			cipher = sta->dot11wCipher;
-			key = &sta->igtk;
-			pn = &sta->igtk_pn.val;
-		#endif
-		#endif /* CONFIG_RTW_MESH */
-		}
-	}
+	params.cipher = key->cipher;
+	params.key_len = key->key_len;
+	params.seq_len = key->seq_len;
+	params.seq = key->seq;
+	params.key = key->key;
 
-	if (!key)
-		goto exit;
+	callback(cookie, &params);
 
-	if (cipher == _WEP40_) {
-		cipher = WLAN_CIPHER_SUITE_WEP40;
-		key_len = sec->dot11DefKeylen[keyid];
-	} else if (cipher == _WEP104_) {
-		cipher = WLAN_CIPHER_SUITE_WEP104;
-		key_len = sec->dot11DefKeylen[keyid];
-	} else if (cipher == _TKIP_ || cipher == _TKIP_WTMIC_) {
-		cipher = WLAN_CIPHER_SUITE_TKIP;
-		key_len = 16;
-	} else if (cipher == _AES_) {
-		cipher = WLAN_CIPHER_SUITE_CCMP;
-		key_len = 16;
-#ifdef CONFIG_WAPI_SUPPORT
-	} else if (cipher == _SMS4_) {
-		cipher = WLAN_CIPHER_SUITE_SMS4;
-		key_len = 16;
+	return key->key_len ? 0 : -ENOENT;
 #endif
-	} else if (cipher == _GCMP_) {
-		cipher = WIFI_CIPHER_SUITE_GCMP;
-		key_len = 16;
-	} else if (cipher == _CCMP_256_) {
-		cipher = WIFI_CIPHER_SUITE_CCMP_256;
-		key_len = 32;
-	} else if (cipher == _GCMP_256_) {
-		cipher = WIFI_CIPHER_SUITE_GCMP_256;
-		key_len = 32;
-	#ifdef CONFIG_IEEE80211W
-	} else if (cipher == _BIP_CMAC_128_) {
-		cipher = WLAN_CIPHER_SUITE_AES_CMAC;
-		key_len = 16;
-	} else if (cipher == _BIP_GMAC_128_) {
-		cipher = WIFI_CIPHER_SUITE_BIP_GMAC_128;
-		key_len = 16;
-	} else if (cipher == _BIP_GMAC_256_) {
-		cipher = WIFI_CIPHER_SUITE_BIP_GMAC_256;
-		key_len = 32;
-	} else if (cipher == _BIP_CMAC_256_) {
-		cipher = WIFI_CIPHER_SUITE_BIP_CMAC_256;
-		key_len = 32;
-	#endif
-	} else {
-		RTW_WARN(FUNC_NDEV_FMT" unknown cipher:%u\n", FUNC_NDEV_ARG(ndev), cipher);
-		rtw_warn_on(1);
-		goto exit;
-	}
-
-	if (pn) {
-		*((u64 *)pn_val) = cpu_to_le64(*pn);
-		pn_len = 6;
-	}
-
-	ret = 0;
-
-exit:
-	RTW_INFO(FUNC_NDEV_FMT
-		GET_KEY_PARAM_FMT_S
-		GET_KEY_PARAM_FMT_2_6_37
-		GET_KEY_PARAM_FMT_E
-		" ret %d\n", FUNC_NDEV_ARG(ndev)
-		GET_KEY_PARAM_ARG_S
-		GET_KEY_PARAM_ARG_2_6_37
-		GET_KEY_PARAM_ARG_E
-		, ret);
-	if (pn)
-		RTW_INFO(FUNC_NDEV_FMT " seq:0x%llx\n", FUNC_NDEV_ARG(ndev), *pn);
-
-	if (ret == 0) {
-		_rtw_memset(&params, 0, sizeof(params));
-
-		params.cipher = cipher;
-		params.key = key->skey;
-		params.key_len = key_len;
-		if (pn) {
-			params.seq = pn_val;
-			params.seq_len = pn_len;
-		}
-
-		callback(cookie, &params);
-	}
-
-	return ret;
+	RTW_INFO(FUNC_NDEV_FMT"\n", FUNC_NDEV_ARG(ndev));
+	return 0;
 }
 
 static int cfg80211_rtw_del_key(struct wiphy *wiphy, struct net_device *ndev,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) || defined(COMPAT_KERNEL_RELEASE)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+				int link_id,
+#endif
 				u8 key_index, bool pairwise, const u8 *mac_addr)
 #else	/* (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 37)) */
 				u8 key_index, const u8 *mac_addr)
@@ -2245,7 +1912,7 @@ static int cfg80211_rtw_del_key(struct wiphy *wiphy, struct net_device *ndev,
 	_adapter *padapter = (_adapter *)rtw_netdev_priv(ndev);
 	struct security_priv *psecuritypriv = &padapter->securitypriv;
 
-	RTW_INFO(FUNC_NDEV_FMT" key_index=%d, addr=%pM\n", FUNC_NDEV_ARG(ndev), key_index, mac_addr);
+	RTW_INFO(FUNC_NDEV_FMT" key_index=%d\n", FUNC_NDEV_ARG(ndev), key_index);
 
 	if (key_index == psecuritypriv->dot11PrivacyKeyIndex) {
 		/* clear the flag of wep default key set. */
@@ -2256,7 +1923,11 @@ static int cfg80211_rtw_del_key(struct wiphy *wiphy, struct net_device *ndev,
 }
 
 static int cfg80211_rtw_set_default_key(struct wiphy *wiphy,
-	struct net_device *ndev, u8 key_index
+	struct net_device *ndev,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	int link_id,
+#endif
+	 u8 key_index
 	#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)) || defined(COMPAT_KERNEL_RELEASE)
 	, bool unicast, bool multicast
 	#endif
@@ -2301,23 +1972,6 @@ static int cfg80211_rtw_set_default_key(struct wiphy *wiphy,
 	return 0;
 
 }
-
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 30))
-int cfg80211_rtw_set_default_mgmt_key(struct wiphy *wiphy,
-	struct net_device *ndev, u8 key_index)
-{
-#define SET_DEF_KEY_PARAM_FMT " key_index=%d"
-#define SET_DEF_KEY_PARAM_ARG , key_index
-
-	RTW_INFO(FUNC_NDEV_FMT
-		SET_DEF_KEY_PARAM_FMT
-		"\n", FUNC_NDEV_ARG(ndev)
-		SET_DEF_KEY_PARAM_ARG
-	);
-
-	return 0;
-}
-#endif
 
 #if defined(CONFIG_GTK_OL) && (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0))
 static int cfg80211_rtw_set_rekey_data(struct wiphy *wiphy,
@@ -5348,13 +5002,13 @@ static int cfg80211_rtw_change_beacon(struct wiphy *wiphy, struct net_device *nd
 	return ret;
 }
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+static int cfg80211_rtw_stop_ap(struct wiphy *wiphy, struct net_device *ndev, unsigned int link_id)
+#else
 static int cfg80211_rtw_stop_ap(struct wiphy *wiphy, struct net_device *ndev)
+#endif
 {
-	_adapter *adapter = (_adapter *)rtw_netdev_priv(ndev);
-
 	RTW_INFO(FUNC_NDEV_FMT"\n", FUNC_NDEV_ARG(ndev));
-
-	rtw_stop_ap_cmd(adapter, RTW_CMDF_WAIT_ACK);
 	return 0;
 }
 #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)) */
@@ -10335,9 +9989,6 @@ static struct cfg80211_ops rtw_cfg80211_ops = {
 	.get_key = cfg80211_rtw_get_key,
 	.del_key = cfg80211_rtw_del_key,
 	.set_default_key = cfg80211_rtw_set_default_key,
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 30))
-	.set_default_mgmt_key = cfg80211_rtw_set_default_mgmt_key,
-#endif
 #if defined(CONFIG_GTK_OL) && (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 1, 0))
 	.set_rekey_data = cfg80211_rtw_set_rekey_data,
 #endif /*CONFIG_GTK_OL*/
@@ -10415,10 +10066,6 @@ static struct cfg80211_ops rtw_cfg80211_ops = {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
 	.set_monitor_channel = cfg80211_rtw_set_monitor_channel,
 #endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0))
-	.get_channel = cfg80211_rtw_get_channel,
-#endif
-
 	.remain_on_channel = cfg80211_rtw_remain_on_channel,
 	.cancel_remain_on_channel = cfg80211_rtw_cancel_remain_on_channel,
 
@@ -10651,12 +10298,24 @@ void rtw_wdev_unregister(struct wireless_dev *wdev)
 
 	rtw_cfg80211_indicate_scan_done(adapter, _TRUE);
 
-	#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)) || defined(COMPAT_KERNEL_RELEASE)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0))
+	if (wdev->connected) {
+		u8 locally_generated = 1;
+		RTW_INFO(FUNC_ADPT_FMT" clear connected by cfg80211_disconnected\n", FUNC_ADPT_ARG(adapter));
+		cfg80211_disconnected(adapter->pnetdev, 0, NULL, 0, locally_generated, GFP_ATOMIC);
+	}
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(5, 19, 0))
+	if (wdev->current_bss) {
+		u8 locally_generated = 1;
+		RTW_INFO(FUNC_ADPT_FMT" clear current_bss by cfg80211_disconnected\n", FUNC_ADPT_ARG(adapter));
+		cfg80211_disconnected(adapter->pnetdev, 0, NULL, 0, locally_generated, GFP_ATOMIC);
+	}
+#elif ((LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)) && (LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0))) || defined(COMPAT_KERNEL_RELEASE)
 	if (wdev->current_bss) {
 		RTW_INFO(FUNC_ADPT_FMT" clear current_bss by cfg80211_disconnected\n", FUNC_ADPT_ARG(adapter));
-		rtw_cfg80211_indicate_disconnect(adapter, 0, 1);
+		cfg80211_disconnected(adapter->pnetdev, 0, NULL, 0, GFP_ATOMIC);
 	}
-	#endif
+#endif
 
 	if (pwdev_priv->pmon_ndev) {
 		RTW_INFO("%s, unregister monitor interface\n", __func__);
