@@ -3,3 +3,5 @@
 **/*.mod
 **/*.o
 **/*.o.d
+**/modules.order
+**/.modules.order.cmd
